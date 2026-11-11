@@ -37,6 +37,7 @@
 #include "ioda/containers/FrameMetadata.h"
 #include "ioda/containers/FrameUtils.h"
 #include "ioda/containers/IFrame.h"
+#include "ioda/core/OsdfSchemaCheck.h"
 #include "ioda/distribution/Accumulator.h"
 #include "ioda/distribution/Distribution.h"
 #include "ioda/distribution/DistributionFactory.h"
@@ -295,6 +296,10 @@ ObsSpace::ObsSpace(const eckit::Configuration & config, const eckit::mpi::Comm &
 
     createMissingObsErrors();
 
+    // Columns created above, after the reader distributed the obs, must have been created on
+    // every MPI task.
+    checkSchemaConsistency("ObsSpace constructor");
+
     oops::Log::debug() << obsname() << ": " << globalNumLocsOutsideTimeWindow()
     << " observations are outside of time window out of " << sourceNumLocs() << std::endl;
     oops::Log::debug() << obsname() << ": " << globalNumLocsRejectQC()
@@ -327,6 +332,10 @@ const ObsSpaceParameters & ObsSpace::params() const {
 
 // -----------------------------------------------------------------------------
 void ObsSpace::save(bool preserveDistribution) {
+    // Catch any divergence in the column schema introduced during the run, even when no output
+    // file is written.
+    checkSchemaConsistency("ObsSpace::save");
+
     // Determine if we should continue on to write out a file. Conditions for
     // writing out a file are:
     //     1. The obsdataout parameter is specified in the YAML configuration
@@ -339,7 +348,8 @@ void ObsSpace::save(bool preserveDistribution) {
         if (use_dataframe_) {
           writer::obsWrite(*(obs_params_->top_level_.obsDataOut.value()),
                            obs_params_->top_level_.ioPool,
-                           obs_params_->comm(), this->obsname(), dist_, osdf_,
+                           obs_params_->comm(), obs_params_->timeComm(),
+                           this->obsname(), dist_, osdf_,
                            osdfMetadata_, preserveDistribution);
         } else {
           std::vector<bool> patchObsVec(nlocs());
@@ -989,6 +999,13 @@ void ObsSpace::redistribute(const eckit::Configuration & redistributeConfig) {
 }
 
 // -----------------------------------------------------------------------------
+void ObsSpace::checkSchemaConsistency(const std::string & context) const {
+  if (use_dataframe_) {
+    ioda::osdfCheckSchemaAcrossRanks(*osdf_, this->comm(), obsname() + ": " + context);
+  }
+}
+
+// -----------------------------------------------------------------------------
 void ObsSpace::updateObsSpace(const eckit::Configuration & cdaConfig) {
   this->syncAppend();
   // For now, only allow append to run on non-overlapping distributions
@@ -1062,7 +1079,7 @@ void ObsSpace::updateObsSpace(const eckit::Configuration & cdaConfig) {
             // with the same index values would produce identical column names and silently merge
             // into a structurally inconsistent result. (Variables present only in the appended
             // frame have no target slice dim and are skipped here -- they are handled by
-            // the column reconciliation in prepareSourceOsdfDerivedVariables / the OSDF append.)
+            // the column reconciliation in osdfAlignColumnsForAppend / the OSDF append.)
             for (const std::string & varName : appendOsdfMetadata.getMultiSliceVars()) {
               const std::string targetDimName = osdfMetadata_.varSliceDimName(varName);
               const std::string appendDimName = appendOsdfMetadata.varSliceDimName(varName);
@@ -1073,7 +1090,7 @@ void ObsSpace::updateObsSpace(const eckit::Configuration & cdaConfig) {
               }
             }
 
-            prepareSourceOsdfDerivedVariables(tempOsdf);
+            osdfAlignColumnsForAppend(*osdf_, tempOsdf);
             appendOsdf(tempOsdf, obsSourceStats);
           } else {
             // Load data into a temporary ObsGroup object and append that to the obs_group_
@@ -1090,6 +1107,7 @@ void ObsSpace::updateObsSpace(const eckit::Configuration & cdaConfig) {
           dist_->computePatchLocs();
           buildRecIdx();
           appendMissingObsErrors(obsSourceStats.nlocs);
+          checkSchemaConsistency("ObsSpace::updateObsSpace");
           for (auto &data : obs_space_associated_) {
             data.get().append();
           }
@@ -1101,45 +1119,6 @@ void ObsSpace::updateObsSpace(const eckit::Configuration & cdaConfig) {
         oops::Log::info() << "WARNING: ObsSpace::append is being used with a generator "
                         << "backend constructed ObsSpace - skipping the append action"
                         << std::endl;
-    }
-}
-
-void ObsSpace::prepareSourceOsdfDerivedVariables(const std::unique_ptr<osdf::IFrame> &srcOsdf) {
-    osdf::ColumnMetadata targetColumnMetadata = osdf_->getData().getColumnMetadata();
-    osdf::ColumnMetadata srcColumnMetadata = srcOsdf->getData().getColumnMetadata();
-
-    // Only act on srcOsdf if it has fewer variables than osdf_
-    // Remaining cases handled by append directly
-    if (targetColumnMetadata.getSizeCols() <= srcColumnMetadata.getSizeCols()) {
-        return;
-    }
-
-    // Find variables which are not in both Osdfs
-    std::vector<std::string> srcColumnNames = srcColumnMetadata.columnNames();
-    vectorDifference unsharedElements
-      = findElementsNotInBothVectors(srcColumnNames, targetColumnMetadata.columnNames());
-
-    if (!unsharedElements.onlyInFirstVector.empty()) {
-      std::string errMsg
-        = "ERROR: The following variables are present in the srcOsdf but not in the targetOsdf: ";
-      for (const std::string &variable : unsharedElements.onlyInFirstVector) {
-        errMsg += (variable + ", ");
-      }
-      throw eckit::BadParameter(errMsg, Here());
-    }
-
-    // Add columns to srcOsdf corresponding to variables in targetOsdf not found in srcOsdf
-    const std::size_t numRows = srcOsdf->numRows();
-
-    for (std::string column : unsharedElements.onlyInSecondVector) {
-      osdf::FrameUtils::callWithSupportedType(osdf_->getColumnType(column),
-                                              [&](auto typeDiscriminator) {
-                                            using T = decltype(typeDiscriminator);
-                                            const std::vector<T> missingValues(
-                                              numRows, util::missingValue<T>());
-                                            std::string unit = osdf_->getColumnUnits(column);
-                                            srcOsdf->appendNewColumn(column, missingValues, unit);
-                                            });
     }
 }
 
